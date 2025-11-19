@@ -1,5 +1,7 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
 const GenericSQLHandler = require('./generic-sql-handler');
@@ -17,25 +19,210 @@ const sqlHandler = new GenericSQLHandler({
   connectionLimit: 10
 });
 
-const excelExport = new EnhancedExcelExport(); // Updated to use enhanced version
+const excelExport = new EnhancedExcelExport();
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
+// Global variable to track SQL endpoints
+let sqlEndpoints = new Map();
+
 /**
- * Enhanced API Endpoint with Display Configuration
- * 
- * Request body options:
- * - sql: SQL query string (required)
- * - params: Query parameters array
- * - download: Boolean for Excel export
- * - filename: Custom filename for download
- * - sheetName: Excel sheet name
- * - displayConfig: Column display configuration
- *   - includeColumns: Array of columns to show (if null, shows all)
- *   - excludeColumns: Array of columns to hide
- *   - columnOrder: Array defining column order
+ * Create or update endpoint for a SQL file
+ */
+function createEndpointForSQLFile(file) {
+  try {
+    const routeName = path.basename(file, '.sql').toLowerCase();
+    const filePath = path.join(__dirname, 'sql_files', file);
+    
+    if (!fs.existsSync(filePath)) {
+      console.log(`❌ SQL file not found: ${filePath}`);
+      return false;
+    }
+
+    const sqlContent = fs.readFileSync(filePath, 'utf8').trim();
+    
+    console.log(`📊 Creating endpoint: /api/${routeName} from ${file}`);
+
+    // Remove existing endpoints if they exist
+    if (sqlEndpoints.has(routeName)) {
+      // In Express, we can't easily remove routes, so we'll rely on the new handlers
+      console.log(`🔄 Updating existing endpoint: /api/${routeName}`);
+    }
+
+    // Store the SQL content
+    sqlEndpoints.set(routeName, sqlContent);
+
+    // Create GET endpoint
+    const getHandler = async (req, res) => {
+      try {
+        const { 
+          download = 'false', 
+          filename = routeName,
+          sheetName = routeName.replace(/_/g, ' '),
+          ...queryParams 
+        } = req.query;
+
+        console.log(`📥 GET Request to /api/${routeName} - Download: ${download}`);
+        
+        // Convert query params to array for prepared statements
+        const params = Object.values(queryParams);
+        
+        // Execute SQL query
+        const queryResult = await sqlHandler.executeQuery(sqlContent, params);
+
+        if (!queryResult.success) {
+          return res.status(400).json(queryResult);
+        }
+
+        // If Excel download requested
+        if (download === 'true') {
+          const excelFile = await excelExport.generateExcelFile(queryResult.data, {
+            filename: `${filename}.xlsx`,
+            sheetName: sheetName,
+            sqlColumns: queryResult.columns,
+            creator: 'SQL File API'
+          });
+
+          res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+          res.setHeader('Content-Disposition', `attachment; filename="${excelFile.filename}"`);
+          
+          return res.send(excelFile.buffer);
+        }
+
+        // Return JSON response
+        res.json(queryResult);
+
+      } catch (error) {
+        console.error(`❌ Error in GET /api/${routeName}:`, error);
+        res.status(500).json({
+          success: false,
+          error: error.message,
+          timestamp: new Date().toISOString()
+        });
+      }
+    };
+
+    // Create POST endpoint
+    const postHandler = async (req, res) => {
+      try {
+        const { 
+          download = false, 
+          filename = routeName,
+          sheetName = routeName.replace(/_/g, ' '),
+          displayConfig = {},
+          params = [],
+          ...otherParams 
+        } = req.body;
+
+        console.log(`📥 POST Request to /api/${routeName} - Download: ${download}`);
+        
+        // Combine body params with explicit params array
+        const allParams = params.length > 0 ? params : Object.values(otherParams);
+        
+        // Execute SQL query
+        const queryResult = await sqlHandler.executeQuery(sqlContent, allParams);
+
+        if (!queryResult.success) {
+          return res.status(400).json(queryResult);
+        }
+
+        // If Excel download requested
+        if (download) {
+          const excelFile = await excelExport.generateExcelFile(queryResult.data, {
+            filename: `${filename}.xlsx`,
+            sheetName: sheetName,
+            sqlColumns: queryResult.columns,
+            displayConfig: displayConfig,
+            creator: 'SQL File API'
+          });
+
+          res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+          res.setHeader('Content-Disposition', `attachment; filename="${excelFile.filename}"`);
+          
+          return res.send(excelFile.buffer);
+        }
+
+        // Return JSON response
+        res.json(queryResult);
+
+      } catch (error) {
+        console.error(`❌ Error in POST /api/${routeName}:`, error);
+        res.status(500).json({
+          success: false,
+          error: error.message,
+          timestamp: new Date().toISOString()
+        });
+      }
+    };
+
+    // Apply routes - these will override any previous routes with same path
+    app.get(`/api/${routeName}`, getHandler);
+    app.post(`/api/${routeName}`, postHandler);
+
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to create endpoint for ${file}:`, error);
+    return false;
+  }
+}
+
+/**
+ * Load all SQL files and create endpoints
+ */
+function loadAllSQLFiles() {
+  const sqlDir = path.join(__dirname, 'sql_files');
+  
+  // Create sql_files directory if it doesn't exist
+  if (!fs.existsSync(sqlDir)) {
+    fs.mkdirSync(sqlDir, { recursive: true });
+    console.log('📁 Created sql_files directory');
+    return;
+  }
+
+  // Read all .sql files
+  const files = fs.readdirSync(sqlDir).filter(file => file.endsWith('.sql'));
+  
+  console.log(`\n📊 Found ${files.length} SQL files:`);
+  
+  let successCount = 0;
+  files.forEach(file => {
+    if (createEndpointForSQLFile(file)) {
+      successCount++;
+      console.log(`   ✅ ${file} → /api/${path.basename(file, '.sql').toLowerCase()}`);
+    } else {
+      console.log(`   ❌ ${file} → FAILED`);
+    }
+  });
+  
+  console.log(`✅ Successfully loaded ${successCount}/${files.length} SQL endpoints`);
+}
+
+/**
+ * Dynamic endpoint to reload SQL files
+ */
+app.post('/api/reload-sql', (req, res) => {
+  try {
+    console.log('🔄 Reloading SQL endpoints...');
+    loadAllSQLFiles();
+    res.json({
+      success: true,
+      message: 'SQL endpoints reloaded successfully',
+      timestamp: new Date().toISOString(),
+      endpoints: Array.from(sqlEndpoints.keys()).map(route => `/api/${route}`)
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+/**
+ * Original generic query endpoint (kept for backward compatibility)
  */
 app.post('/api/query', async (req, res) => {
   try {
@@ -45,7 +232,7 @@ app.post('/api/query', async (req, res) => {
       download = false, 
       filename = 'export',
       sheetName = 'Export Data',
-      displayConfig = {} // New parameter for column control
+      displayConfig = {}
     } = req.body;
 
     if (!sql) {
@@ -56,9 +243,8 @@ app.post('/api/query', async (req, res) => {
       });
     }
 
-    console.log(`📥 Request - Download: ${download}, Display Config:`, displayConfig);
-    console.log(`SQL: ${sql.substring(0, 100)}...`);
-
+    console.log(`📥 Request to /api/query - Download: ${download}`);
+    
     // Execute SQL query
     const queryResult = await sqlHandler.executeQuery(sql, params);
 
@@ -68,39 +254,21 @@ app.post('/api/query', async (req, res) => {
 
     // If Excel download requested
     if (download) {
-      try {
-        console.log(`📊 Generating Excel with display config...`);
-        
-        const excelFile = await excelExport.generateExcelFile(queryResult.data, {
-          filename: filename,
-          sheetName: sheetName,
-          sqlColumns: queryResult.columns, // Pass SQL column names
-          displayConfig: displayConfig,    // Pass display configuration
-          creator: 'Enhanced SQL Excel Export API'
-        });
+      const excelFile = await excelExport.generateExcelFile(queryResult.data, {
+        filename: filename,
+        sheetName: sheetName,
+        sqlColumns: queryResult.columns,
+        displayConfig: displayConfig,
+        creator: 'Generic Query API'
+      });
 
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        res.setHeader('Content-Disposition', `attachment; filename="${excelFile.filename}"`);
-        res.setHeader('Content-Length', excelFile.buffer.length);
-        res.setHeader('X-Row-Count', excelFile.rowCount);
-        res.setHeader('X-Column-Count', excelFile.columnCount);
-        
-        console.log(`✅ Excel sent: ${excelFile.filename} (${excelFile.buffer.length} bytes)`);
-        
-        return res.send(excelFile.buffer);
-
-      } catch (excelError) {
-        console.error('❌ Excel generation failed:', excelError);
-        return res.status(500).json({
-          success: false,
-          error: `Excel export failed: ${excelError.message}`,
-          timestamp: new Date().toISOString()
-        });
-      }
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${excelFile.filename}"`);
+      
+      return res.send(excelFile.buffer);
     }
 
     // Return JSON response
-    console.log(`✅ JSON response: ${queryResult.count} rows`);
     res.json(queryResult);
 
   } catch (error) {
@@ -113,9 +281,6 @@ app.post('/api/query', async (req, res) => {
   }
 });
 
-/**
- * GET endpoint for simple queries
- */
 app.get('/api/query', async (req, res) => {
   try {
     const { sql, download = 'false', filename = 'export' } = req.query;
@@ -163,106 +328,99 @@ app.get('/api/query', async (req, res) => {
 app.get('/health', async (req, res) => {
   const dbStatus = await sqlHandler.testConnection();
   
+  const endpoints = Array.from(sqlEndpoints.keys()).map(route => `/api/${route}`);
+  
   res.json({
     status: 'OK',
     database: dbStatus.connected ? 'Connected' : 'Disconnected',
     timestamp: new Date().toISOString(),
-    service: 'Enhanced SQL & Excel Export API'
+    service: 'Enhanced SQL & Excel Export API',
+    sqlEndpoints: endpoints,
+    totalEndpoints: endpoints.length
   });
 });
 
 /**
- * Demo endpoint showing different display configurations
+ * List all available SQL endpoints
  */
-app.get('/api/demo-export', async (req, res) => {
-  try {
-    const { type = 'basic' } = req.query;
-
-    // Sample data with various column types
-    const sampleData = [
-      { 
-        user_id: 1, 
-        full_name: 'John Doe', 
-        email: 'john@example.com',
-        age: 30,
-        Market_Cap_Curr_Display: 1500000,
-        revenue_curr: 250000,
-        growth_rate_pct: 0.15,
-        created_at: new Date('2024-01-15'),
-        internal_code: 'XYZ123' // This might be excluded
-      },
-      { 
-        user_id: 2, 
-        full_name: 'Jane Smith', 
-        email: 'jane@example.com',
-        age: 25,
-        Market_Cap_Curr_Display: 2300000,
-        revenue_curr: 380000,
-        growth_rate_pct: 0.22,
-        created_at: new Date('2024-02-20'),
-        internal_code: 'ABC456'
+app.get('/api/sql-endpoints', (req, res) => {
+  const endpoints = Array.from(sqlEndpoints.entries()).map(([routeName, sqlContent]) => {
+    return {
+      endpoint: `/api/${routeName}`,
+      filename: `${routeName}.sql`,
+      sqlPreview: sqlContent.substring(0, 100) + (sqlContent.length > 100 ? '...' : ''),
+      methods: ['GET', 'POST'],
+      example: {
+        get: `http://localhost:${PORT}/api/${routeName}?download=false`,
+        download: `http://localhost:${PORT}/api/${routeName}?download=true`
       }
-    ];
+    };
+  });
 
-    let displayConfig = {};
-    let filename = 'demo_export.xlsx';
+  res.json({ 
+    endpoints,
+    reload: `POST http://localhost:${PORT}/api/reload-sql`
+  });
+});
 
-    switch(type) {
-      case 'filtered':
-        // Show only specific columns
-        displayConfig = {
-          includeColumns: ['full_name', 'Market_Cap_Curr_Display', 'revenue_curr', 'growth_rate_pct']
-        };
-        filename = 'filtered_columns.xlsx';
-        break;
-
-      case 'ordered':
-        // Custom column order
-        displayConfig = {
-          columnOrder: ['full_name', 'email', 'Market_Cap_Curr_Display', 'age']
-        };
-        filename = 'custom_order.xlsx';
-        break;
-
-      case 'excluded':
-        // Exclude internal columns
-        displayConfig = {
-          excludeColumns: ['user_id', 'internal_code']
-        };
-        filename = 'public_data.xlsx';
-        break;
-
-      default:
-        // Show all columns with default formatting
-        filename = 'all_columns.xlsx';
+/**
+ * Create endpoint for a specific SQL file
+ */
+app.post('/api/create-endpoint', (req, res) => {
+  try {
+    const { filename } = req.body;
+    
+    if (!filename) {
+      return res.status(400).json({
+        success: false,
+        error: 'Filename is required',
+        timestamp: new Date().toISOString()
+      });
     }
 
-    const excelFile = await excelExport.generateExcelFile(sampleData, {
-      filename: filename,
-      sheetName: 'Demo Data',
-      displayConfig: displayConfig,
-      creator: 'Demo Export'
-    });
+    if (!filename.endsWith('.sql')) {
+      return res.status(400).json({
+        success: false,
+        error: 'File must be a .sql file',
+        timestamp: new Date().toISOString()
+      });
+    }
 
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${excelFile.filename}"`);
+    const success = createEndpointForSQLFile(filename);
     
-    res.send(excelFile.buffer);
-
+    if (success) {
+      res.json({
+        success: true,
+        message: `Endpoint created for ${filename}`,
+        endpoint: `/api/${path.basename(filename, '.sql').toLowerCase()}`,
+        timestamp: new Date().toISOString()
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        error: `Failed to create endpoint for ${filename}`,
+        timestamp: new Date().toISOString()
+      });
+    }
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
   }
 });
+
+// Initial load of SQL files
+loadAllSQLFiles();
 
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Enhanced SQL & Excel API Server running on port ${PORT}`);
   console.log(`🏥 Health check: http://localhost:${PORT}/health`);
-  console.log(`📊 Demo exports:`);
-  console.log(`   - All columns: http://localhost:${PORT}/api/demo-export?type=basic`);
-  console.log(`   - Filtered: http://localhost:${PORT}/api/demo-export?type=filtered`);
-  console.log(`   - Ordered: http://localhost:${PORT}/api/demo-export?type=ordered`);
-  console.log(`   - Excluded: http://localhost:${PORT}/api/demo-export?type=excluded`);
+  console.log(`📋 Available SQL endpoints: http://localhost:${PORT}/api/sql-endpoints`);
+  console.log(`🔄 Reload endpoints: POST http://localhost:${PORT}/api/reload-sql`);
+  console.log(`\n📁 Place your .sql files in the 'sql_files' directory and reload!`);
 });
 
 module.exports = app;
